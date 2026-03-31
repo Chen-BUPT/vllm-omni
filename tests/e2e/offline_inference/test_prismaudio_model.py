@@ -154,6 +154,28 @@ def test_prismaudio_e2e_prompt_uses_conditioning_path_contract(tmp_path: Path) -
     assert set(loaded) >= {"video_features", "text_features", "sync_features"}
 
 
+def test_prismaudio_conditioning_loader_ignores_npz_string_metadata(tmp_path: Path) -> None:
+    fixture_path = tmp_path / "features_with_metadata.npz"
+    np.savez(
+        fixture_path,
+        id="demo",
+        video_path="/tmp/demo.mp4",
+        caption_cot="PrismAudio e2e smoke request",
+        video_features=np.ones((10, 8), dtype=np.float32),
+        text_features=np.ones((12, 8), dtype=np.float32),
+        sync_features=np.ones((16, 4), dtype=np.float32),
+    )
+
+    loaded = load_prismaudio_conditioning_data(fixture_path)
+
+    assert isinstance(loaded["video_features"], torch.Tensor)
+    assert isinstance(loaded["text_features"], torch.Tensor)
+    assert isinstance(loaded["sync_features"], torch.Tensor)
+    assert loaded["id"] == "demo"
+    assert loaded["video_path"] == "/tmp/demo.mp4"
+    assert loaded["caption_cot"] == "PrismAudio e2e smoke request"
+
+
 def test_prismaudio_e2e_prompt_uses_video_path_contract(tmp_path: Path) -> None:
     video_path = tmp_path / "demo.mp4"
     video_path.write_bytes(b"")

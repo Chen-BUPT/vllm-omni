@@ -92,7 +92,12 @@ def load_prismaudio_conditioning_data(conditioning_path: str | PathLike[str]) ->
     normalized: dict[str, Any] = {}
     for key, value in raw_data.items():
         if isinstance(value, np.ndarray):
-            normalized[key] = torch.from_numpy(value)
+            if np.issubdtype(value.dtype, np.number) or np.issubdtype(value.dtype, np.bool_):
+                normalized[key] = torch.from_numpy(value)
+            elif value.ndim == 0:
+                normalized[key] = value.item()
+            else:
+                normalized[key] = value.tolist()
         else:
             normalized[key] = value
     return normalized
