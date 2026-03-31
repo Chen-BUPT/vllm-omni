@@ -1000,8 +1000,12 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
         get_conditioning_inputs = getattr(self.transformer, "get_conditioning_inputs", None)
         inner_model = getattr(self.transformer, "model", None)
         if callable(conditioner) and callable(get_conditioning_inputs) and isinstance(inner_model, nn.Module):
+            _runtime_device, runtime_dtype = self._get_runtime_latent_device_dtype()
             conditioning_tensors = conditioner(
-                tuple(self._normalize_conditioning_for_official_wrapper(item) for item in conditioning_batch),
+                tuple(
+                    self._normalize_conditioning_for_official_wrapper(item, runtime_dtype=runtime_dtype)
+                    for item in conditioning_batch
+                ),
                 device,
             )
             sampling_conditioning = dict(get_conditioning_inputs(conditioning_tensors))
@@ -1041,11 +1045,18 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
         }
         return self.transformer, stacked_conditioning
 
-    def _normalize_conditioning_for_official_wrapper(self, conditioning: Mapping[str, Any]) -> dict[str, Any]:
+    def _normalize_conditioning_for_official_wrapper(
+        self,
+        conditioning: Mapping[str, Any],
+        *,
+        runtime_dtype: torch.dtype | None = None,
+    ) -> dict[str, Any]:
         def _normalize(value: Any) -> Any:
             if isinstance(value, torch.Tensor):
                 if value.ndim > 1 and value.shape[0] == 1:
-                    return value[0]
+                    value = value[0]
+                if runtime_dtype is not None and torch.is_floating_point(value):
+                    return value.to(dtype=runtime_dtype)
                 return value
             if isinstance(value, tuple):
                 return tuple(_normalize(item) for item in value)

@@ -2139,6 +2139,70 @@ def test_prismaudio_pipeline_strips_single_prompt_batch_dim_for_official_wrapper
     }
 
 
+def test_prismaudio_pipeline_casts_official_wrapper_conditioning_to_runtime_dtype():
+    class _InnerTransformer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(1024, 1024, bias=False, dtype=torch.bfloat16)
+
+        def forward(self, x, t, **kwargs):
+            return torch.zeros_like(x)
+
+    class _Decoded:
+        def __init__(self, sample):
+            self.sample = sample
+
+    class _FakeVAE(nn.Module):
+        def decode(self, latents):
+            return _Decoded(latents[:, :2, :])
+
+    class _OfficialStyleWrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = _InnerTransformer()
+            self.seen_dtypes: dict[str, torch.dtype] | None = None
+
+        def conditioner(self, metadata, device):
+            sample = metadata[0]
+            self.seen_dtypes = {
+                key: value.dtype for key, value in sample.items() if isinstance(value, torch.Tensor)
+            }
+            return {
+                "video_features": (
+                    self.model.proj(sample["video_features"].to(device=device)),
+                    torch.ones(sample["video_features"].shape[0], device=device, dtype=torch.bool),
+                ),
+            }
+
+        def get_conditioning_inputs(self, conditioning_tensors):
+            return {
+                "cross_attn_cond": conditioning_tensors["video_features"][0],
+                "cross_attn_mask": conditioning_tensors["video_features"][1],
+            }
+
+    model_cls = DiffusionModelRegistry._try_load_model_cls("PrismAudioPipeline")
+    transformer = _OfficialStyleWrapper()
+    pipeline = model_cls(transformer=transformer, vae=_FakeVAE())
+    req = _make_request(
+        additional_information={
+            "video_features": torch.randn(1, 10, 1024, dtype=torch.float32),
+            "text_features": torch.randn(1, 32, 1024, dtype=torch.float32),
+            "sync_features": torch.randn(1, 216, 768, dtype=torch.float32),
+        },
+        extra_args={"num_inference_steps": 1, "cfg_scale": 2.0},
+    )
+    req.sampling_params.latents = torch.randn(1, 64, 4, dtype=torch.bfloat16)
+
+    output = pipeline.forward(req)
+
+    assert output.output.shape == (1, 2, 4)
+    assert transformer.seen_dtypes == {
+        "video_features": torch.bfloat16,
+        "text_features": torch.bfloat16,
+        "sync_features": torch.bfloat16,
+    }
+
+
 def test_prismaudio_pipeline_uses_sampling_seed_for_auto_initialized_latents():
     class _FakeTransformer(nn.Module):
         def __init__(self):
