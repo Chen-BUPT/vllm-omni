@@ -90,6 +90,69 @@ def _build_video_path_prompt(video_path: Path, caption_cot: str) -> dict[str, ob
     }
 
 
+def _runtime_factory_scale(video_path: str, caption_cot: str) -> float:
+    token = f"{video_path}|{caption_cot}"
+    checksum = sum(ord(ch) for ch in token)
+    return 1.0 + (checksum % 7) / 10.0
+
+
+def _build_factory_backed_video_preprocessor(prompt: object, _runtime_config: object) -> dict[str, object]:
+    if not isinstance(prompt, dict):
+        raise TypeError(f"Expected mapping prompt for factory-backed video preprocessing, got {type(prompt)!r}.")
+
+    additional_information = prompt.get("additional_information")
+    if not isinstance(additional_information, dict):
+        raise TypeError("Expected prompt.additional_information to be a mapping.")
+
+    video_path = additional_information.get("video_path")
+    caption_cot = additional_information.get("caption_cot")
+    if not isinstance(video_path, str) or not isinstance(caption_cot, str):
+        raise ValueError("Factory-backed video preprocessing requires string video_path and caption_cot.")
+
+    scale = _runtime_factory_scale(video_path, caption_cot)
+    return {
+        "clip_chunk": torch.full((3, 4, 4, 3), scale, dtype=torch.float32),
+        "sync_chunk": torch.full((5, 3, 4, 4), scale, dtype=torch.float32),
+    }
+
+
+class _FactoryBackedPrismAudioFeatureExtractor:
+    def encode_t5_text(self, captions: list[str]) -> torch.Tensor:
+        features = []
+        for caption in captions:
+            scale = _runtime_factory_scale("caption", caption)
+            features.append(torch.full((32, 1024), scale, dtype=torch.float32))
+        return torch.stack(features, dim=0)
+
+    def encode_video_and_text_with_videoprism(
+        self,
+        clip_input: torch.Tensor,
+        captions: list[str],
+    ) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor]:
+        scales = clip_input.mean(dim=(1, 2, 3, 4), dtype=torch.float32)
+        frame_embed = torch.stack(
+            [torch.full((10, 1024), float(scale), dtype=torch.float32) for scale in scales],
+            dim=0,
+        )
+        global_video_features = scales.unsqueeze(-1)
+        global_text_features = torch.tensor(
+            [[_runtime_factory_scale("caption", caption)] for caption in captions],
+            dtype=torch.float32,
+        )
+        return global_video_features, frame_embed, None, global_text_features
+
+    def encode_video_with_sync(self, sync_input: torch.Tensor) -> torch.Tensor:
+        scales = sync_input.mean(dim=(1, 2, 3, 4), dtype=torch.float32)
+        return torch.stack(
+            [torch.full((216, 768), float(scale), dtype=torch.float32) for scale in scales],
+            dim=0,
+        )
+
+
+def _build_factory_backed_feature_extractor(_runtime_config: object) -> _FactoryBackedPrismAudioFeatureExtractor:
+    return _FactoryBackedPrismAudioFeatureExtractor()
+
+
 def _make_local_prismaudio_model_dir(tmp_path: Path, official_config_path: Path) -> Path:
     model_dir = tmp_path / "local-prismaudio-e2e"
     transformer_dir = model_dir / "transformer"
@@ -189,6 +252,27 @@ def test_prismaudio_e2e_prompt_uses_video_path_contract(tmp_path: Path) -> None:
             "caption_cot": "semantic and temporal cot text",
         },
     }
+
+
+def test_prismaudio_factory_backed_runtime_helpers_preserve_video_text_contract(tmp_path: Path) -> None:
+    video_path = tmp_path / "demo.mp4"
+    video_path.write_bytes(b"")
+    prompt = _build_video_path_prompt(video_path, "semantic and temporal cot text")
+
+    preprocessing = _build_factory_backed_video_preprocessor(prompt, object())
+    extractor = _build_factory_backed_feature_extractor(object())
+    text_features = extractor.encode_t5_text(["semantic and temporal cot text"])
+    _global_video, video_features, _ignored, _global_text = extractor.encode_video_and_text_with_videoprism(
+        preprocessing["clip_chunk"].unsqueeze(0),
+        ["semantic and temporal cot text"],
+    )
+    sync_features = extractor.encode_video_with_sync(preprocessing["sync_chunk"].unsqueeze(0))
+
+    assert tuple(preprocessing["clip_chunk"].shape) == (3, 4, 4, 3)
+    assert tuple(preprocessing["sync_chunk"].shape) == (5, 3, 4, 4)
+    assert tuple(video_features.shape) == (1, 10, 1024)
+    assert tuple(text_features.shape) == (1, 32, 1024)
+    assert tuple(sync_features.shape) == (1, 216, 768)
 
 
 @pytest.mark.asyncio
@@ -358,6 +442,90 @@ async def test_prismaudio_real_model_with_runtime_preprocessing_e2e_smoke(tmp_pa
 
     print(
         "\n[PrismAudio E2E Runtime Preprocessing]"
+        f" init_s={init_elapsed_s:.2f}"
+        f" inference_s={inference_elapsed_s:.2f}"
+        f" steps={num_inference_steps}"
+        f" cfg_scale={cfg_scale:.2f}"
+        f" sample_rate={expected_sample_rate}"
+        f" audio_shape={tuple(audio.shape)}"
+        f" peak_memory_mb={result.peak_memory_mb:.2f}"
+    )
+
+
+@pytest.mark.asyncio
+@hardware_test(res={"cuda": "L4"})
+async def test_prismaudio_real_model_with_factory_backed_video_text_e2e_smoke(tmp_path: Path) -> None:
+    transformer_ckpt = _require_existing_path_from_env(_ENV_TRANSFORMER_CKPT)
+    vae_ckpt = _require_existing_path_from_env(_ENV_VAE_CKPT)
+    official_config_path = _resolve_prismaudio_config_path()
+    video_path = _require_existing_path_from_env(_ENV_VIDEO)
+    caption_cot = _require_non_empty_env(_ENV_CAPTION_COT)
+
+    if current_omni_platform.device_type != "cuda":
+        pytest.skip("PrismAudio real-model smoke test currently requires CUDA.")
+
+    local_model_dir = _make_local_prismaudio_model_dir(tmp_path, official_config_path)
+    model_config = json.loads(official_config_path.read_text())
+    expected_sample_rate = int(model_config.get("sample_rate", 44100))
+    expected_audio_channels = int(model_config.get("audio_channels", 2))
+    expected_num_samples = int(model_config.get("sample_size", 0))
+
+    init_start = time.perf_counter()
+    diffusion = AsyncOmniDiffusion(
+        model=str(local_model_dir),
+        model_config={
+            "prismaudio_model_config_path": str(official_config_path),
+            "video_preprocessor_factory": "tests.e2e.offline_inference.test_prismaudio_model._build_factory_backed_video_preprocessor",
+            "feature_extractor_factory": "tests.e2e.offline_inference.test_prismaudio_model._build_factory_backed_feature_extractor",
+        },
+        model_paths={
+            "transformer": str(transformer_ckpt),
+            "vae": str(vae_ckpt),
+        },
+        dtype=_resolve_dtype(),
+        num_gpus=1,
+    )
+    init_elapsed_s = time.perf_counter() - init_start
+
+    try:
+        num_inference_steps = int(os.environ.get(_ENV_STEPS, "4"))
+        cfg_scale = float(os.environ.get(_ENV_CFG_SCALE, "5.0"))
+        seed = int(os.environ.get(_ENV_SEED, "42"))
+        sampling_params = OmniDiffusionSamplingParams(
+            num_inference_steps=num_inference_steps,
+            generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed),
+            num_outputs_per_prompt=1,
+            extra_args={
+                "cfg_scale": cfg_scale,
+            },
+        )
+
+        prompt = _build_video_path_prompt(video_path, caption_cot)
+
+        inference_start = time.perf_counter()
+        result = await diffusion.generate(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            request_id="prismaudio-e2e-factory-backed-video-text-smoke",
+        )
+        inference_elapsed_s = time.perf_counter() - inference_start
+    finally:
+        diffusion.close()
+
+    assert isinstance(result, OmniRequestOutput)
+    assert result.final_output_type == "audio"
+
+    audio = result.multimodal_output.get("audio")
+    assert isinstance(audio, np.ndarray)
+    assert audio.ndim == 3
+    assert audio.shape[0] == 1
+    assert audio.shape[1] == expected_audio_channels
+    assert audio.shape[2] > 0
+    if expected_num_samples > 0:
+        assert audio.shape[2] == expected_num_samples
+
+    print(
+        "\n[PrismAudio E2E Factory-Backed Video+Text]"
         f" init_s={init_elapsed_s:.2f}"
         f" inference_s={inference_elapsed_s:.2f}"
         f" steps={num_inference_steps}"
