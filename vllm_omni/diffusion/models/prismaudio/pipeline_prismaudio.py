@@ -188,6 +188,7 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
 
     support_audio_output = True
     supports_step_execution = True
+    skip_default_dummy_run = True
     required_feature_names = ("video_features", "text_features", "sync_features")
     default_num_inference_steps = 24
     default_cfg_scale = 5.0

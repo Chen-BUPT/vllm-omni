@@ -52,6 +52,13 @@ def supports_audio_output(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_audio_output", False))
 
 
+def should_skip_default_dummy_run(model_class_name: str) -> bool:
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        return False
+    return bool(getattr(model_cls, "skip_default_dummy_run", False))
+
+
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
@@ -76,12 +83,13 @@ class DiffusionEngine:
         self.scheduler.initialize(od_config)
         self._rpc_lock = threading.Lock()
 
-        try:
-            self._dummy_run()
-        except Exception as e:
-            logger.error(f"Dummy run failed: {e}")
-            self.close()
-            raise e
+        if not should_skip_default_dummy_run(od_config.model_class_name):
+            try:
+                self._dummy_run()
+            except Exception as e:
+                logger.error(f"Dummy run failed: {e}")
+                self.close()
+                raise e
 
     def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
         diffusion_engine_start_time = time.perf_counter()

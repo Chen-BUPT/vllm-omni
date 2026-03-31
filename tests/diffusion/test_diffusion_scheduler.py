@@ -297,3 +297,28 @@ class TestDiffusionEngine:
 
         with pytest.raises(RuntimeError, match="Dummy run failed: boom"):
             engine._dummy_run()
+
+    def test_skips_dummy_run_for_models_that_opt_out(self) -> None:
+        class _FeatureOnlyModel:
+            skip_default_dummy_run = True
+
+        od_config = Mock(model_class_name="feature_only_model")
+        fake_executor_cls = Mock(return_value=Mock())
+        scheduler = _StubScheduler(_make_request("skip"), DiffusionOutput(output=None))
+
+        with (
+            patch(
+                "vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func",
+                return_value=None,
+            ),
+            patch(
+                "vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func",
+                return_value=None,
+            ),
+            patch("vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class", return_value=fake_executor_cls),
+            patch("vllm_omni.diffusion.diffusion_engine.DiffusionModelRegistry._try_load_model_cls", return_value=_FeatureOnlyModel),
+            patch.object(DiffusionEngine, "_dummy_run", return_value=None) as dummy_run,
+        ):
+            DiffusionEngine(od_config, scheduler=scheduler)
+
+        dummy_run.assert_not_called()
