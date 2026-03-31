@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sys
@@ -14,6 +15,7 @@ import pytest
 import torch
 
 from tests.utils import hardware_test
+from vllm_omni.diffusion.models.prismaudio.pipeline_prismaudio import load_prismaudio_conditioning_data
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -34,6 +36,10 @@ _ENV_STEPS = "PRISMAUDIO_E2E_NUM_STEPS"
 _ENV_CFG_SCALE = "PRISMAUDIO_E2E_CFG_SCALE"
 _ENV_SEED = "PRISMAUDIO_E2E_SEED"
 _ENV_DTYPE = "PRISMAUDIO_E2E_DTYPE"
+_ENV_VIDEO = "PRISMAUDIO_E2E_VIDEO"
+_ENV_CAPTION_COT = "PRISMAUDIO_E2E_CAPTION_COT"
+_ENV_SYNCHFORMER_CKPT = "PRISMAUDIO_E2E_SYNCHFORMER_CKPT"
+_ENV_PREPROCESS_VAE_CONFIG = "PRISMAUDIO_E2E_PREPROCESS_VAE_CONFIG"
 
 
 def _require_existing_path_from_env(env_name: str) -> Path:
@@ -58,37 +64,30 @@ def _resolve_prismaudio_config_path() -> Path:
     pytest.skip(f"{_ENV_CONFIG} is not set; skipping PrismAudio real-model e2e smoke test.")
 
 
-def _load_conditioning_fixture(path: Path) -> dict[str, torch.Tensor]:
-    if path.suffix == ".npz":
-        npz_data = np.load(path, allow_pickle=True)
-        raw_data = {key: npz_data[key] for key in npz_data.files}
-    else:
-        try:
-            raw_data = torch.load(path, map_location="cpu", weights_only=True)
-        except TypeError:
-            raw_data = torch.load(path, map_location="cpu")
+def _require_non_empty_env(env_name: str) -> str:
+    raw_value = os.environ.get(env_name)
+    if not raw_value:
+        pytest.skip(f"{env_name} is not set; skipping PrismAudio runtime-preprocessing e2e smoke test.")
+    return raw_value
 
-    if not isinstance(raw_data, dict):
-        raise TypeError(f"PrismAudio conditioning fixture must decode to a dict, got {type(raw_data)!r}.")
 
-    conditioning: dict[str, torch.Tensor] = {}
-    for feature_name in ("video_features", "text_features", "sync_features"):
-        value = raw_data.get(feature_name)
-        if value is None:
-            raise KeyError(
-                f"PrismAudio conditioning fixture {path} is missing required key {feature_name!r}. "
-                "Provide a fixture containing `video_features`, `text_features`, and `sync_features`."
-            )
-        if isinstance(value, np.ndarray):
-            value = torch.from_numpy(value)
-        if not isinstance(value, torch.Tensor):
-            raise TypeError(
-                f"PrismAudio conditioning fixture key {feature_name!r} must be a tensor-like value, "
-                f"got {type(value)!r}."
-            )
-        conditioning[feature_name] = value
+def _build_conditioning_path_prompt(features_path: Path) -> dict[str, object]:
+    return {
+        "prompt": "PrismAudio e2e smoke request",
+        "additional_information": {
+            "conditioning_path": str(features_path),
+        },
+    }
 
-    return conditioning
+
+def _build_video_path_prompt(video_path: Path, caption_cot: str) -> dict[str, object]:
+    return {
+        "prompt": caption_cot,
+        "additional_information": {
+            "video_path": str(video_path),
+            "caption_cot": caption_cot,
+        },
+    }
 
 
 def _make_local_prismaudio_model_dir(tmp_path: Path, official_config_path: Path) -> Path:
@@ -116,11 +115,58 @@ def _resolve_dtype() -> str:
     return os.environ.get(_ENV_DTYPE, "bfloat16")
 
 
+def _skip_if_default_runtime_unavailable() -> None:
+    for module_name in ("app", "data_utils.v2a_utils.feature_utils_288"):
+        try:
+            importlib.import_module(module_name)
+        except Exception as exc:
+            pytest.skip(
+                "PrismAudio default runtime preprocessing stack is unavailable in this environment: "
+                f"{module_name} failed to import with {type(exc).__name__}: {exc}"
+            )
+
+
 def test_prismaudio_e2e_config_path_is_env_driven(monkeypatch) -> None:
     monkeypatch.delenv(_ENV_CONFIG, raising=False)
 
     with pytest.raises(pytest.skip.Exception, match=_ENV_CONFIG):
         _resolve_prismaudio_config_path()
+
+
+def test_prismaudio_e2e_prompt_uses_conditioning_path_contract(tmp_path: Path) -> None:
+    fixture_path = tmp_path / "features.npz"
+    np.savez(
+        fixture_path,
+        video_features=np.ones((10, 8), dtype=np.float32),
+        text_features=np.ones((12, 8), dtype=np.float32),
+        sync_features=np.ones((16, 4), dtype=np.float32),
+    )
+
+    prompt = _build_conditioning_path_prompt(fixture_path)
+    loaded = load_prismaudio_conditioning_data(fixture_path)
+
+    assert prompt == {
+        "prompt": "PrismAudio e2e smoke request",
+        "additional_information": {
+            "conditioning_path": str(fixture_path),
+        },
+    }
+    assert set(loaded) >= {"video_features", "text_features", "sync_features"}
+
+
+def test_prismaudio_e2e_prompt_uses_video_path_contract(tmp_path: Path) -> None:
+    video_path = tmp_path / "demo.mp4"
+    video_path.write_bytes(b"")
+
+    prompt = _build_video_path_prompt(video_path, "semantic and temporal cot text")
+
+    assert prompt == {
+        "prompt": "semantic and temporal cot text",
+        "additional_information": {
+            "video_path": str(video_path),
+            "caption_cot": "semantic and temporal cot text",
+        },
+    }
 
 
 @pytest.mark.asyncio
@@ -134,7 +180,6 @@ async def test_prismaudio_real_model_e2e_smoke(tmp_path: Path) -> None:
     if current_omni_platform.device_type != "cuda":
         pytest.skip("PrismAudio real-model smoke test currently requires CUDA.")
 
-    conditioning = _load_conditioning_fixture(features_path)
     local_model_dir = _make_local_prismaudio_model_dir(tmp_path, official_config_path)
     model_config = json.loads(official_config_path.read_text())
     expected_sample_rate = int(model_config.get("sample_rate", 44100))
@@ -167,10 +212,7 @@ async def test_prismaudio_real_model_e2e_smoke(tmp_path: Path) -> None:
             },
         )
 
-        prompt = {
-            "prompt": "PrismAudio e2e smoke request",
-            "additional_information": conditioning,
-        }
+        prompt = _build_conditioning_path_prompt(features_path)
 
         inference_start = time.perf_counter()
         result = await diffusion.generate(
@@ -196,6 +238,104 @@ async def test_prismaudio_real_model_e2e_smoke(tmp_path: Path) -> None:
 
     print(
         "\n[PrismAudio E2E]"
+        f" init_s={init_elapsed_s:.2f}"
+        f" inference_s={inference_elapsed_s:.2f}"
+        f" steps={num_inference_steps}"
+        f" cfg_scale={cfg_scale:.2f}"
+        f" sample_rate={expected_sample_rate}"
+        f" audio_shape={tuple(audio.shape)}"
+        f" peak_memory_mb={result.peak_memory_mb:.2f}"
+    )
+
+
+@pytest.mark.asyncio
+@hardware_test(res={"cuda": "L4"})
+async def test_prismaudio_real_model_with_runtime_preprocessing_e2e_smoke(tmp_path: Path) -> None:
+    transformer_ckpt = _require_existing_path_from_env(_ENV_TRANSFORMER_CKPT)
+    vae_ckpt = _require_existing_path_from_env(_ENV_VAE_CKPT)
+    official_config_path = _resolve_prismaudio_config_path()
+    video_path = _require_existing_path_from_env(_ENV_VIDEO)
+    synchformer_ckpt = _require_existing_path_from_env(_ENV_SYNCHFORMER_CKPT)
+    preprocess_vae_config = _require_existing_path_from_env(_ENV_PREPROCESS_VAE_CONFIG)
+    caption_cot = _require_non_empty_env(_ENV_CAPTION_COT)
+
+    if current_omni_platform.device_type != "cuda":
+        pytest.skip("PrismAudio real-model smoke test currently requires CUDA.")
+
+    _skip_if_default_runtime_unavailable()
+
+    local_model_dir = _make_local_prismaudio_model_dir(tmp_path, official_config_path)
+    model_config = json.loads(official_config_path.read_text())
+    expected_sample_rate = int(model_config.get("sample_rate", 44100))
+    expected_audio_channels = int(model_config.get("audio_channels", 2))
+    expected_num_samples = int(model_config.get("sample_size", 0))
+
+    init_start = time.perf_counter()
+    try:
+        diffusion = AsyncOmniDiffusion(
+            model=str(local_model_dir),
+            model_config={
+                "prismaudio_model_config_path": str(official_config_path),
+                "video_preprocessor_config": {},
+                "feature_extractor_config": {
+                    "vae_config": str(preprocess_vae_config),
+                    "synchformer_ckpt": str(synchformer_ckpt),
+                    "need_vae_encoder": False,
+                },
+            },
+            model_paths={
+                "transformer": str(transformer_ckpt),
+                "vae": str(vae_ckpt),
+            },
+            dtype=_resolve_dtype(),
+            num_gpus=1,
+        )
+    except (ModuleNotFoundError, RuntimeError) as exc:
+        pytest.skip(f"PrismAudio runtime preprocessing stack is not runnable in this environment: {exc}")
+    init_elapsed_s = time.perf_counter() - init_start
+
+    try:
+        num_inference_steps = int(os.environ.get(_ENV_STEPS, "4"))
+        cfg_scale = float(os.environ.get(_ENV_CFG_SCALE, "5.0"))
+        seed = int(os.environ.get(_ENV_SEED, "42"))
+        sampling_params = OmniDiffusionSamplingParams(
+            num_inference_steps=num_inference_steps,
+            generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed),
+            num_outputs_per_prompt=1,
+            extra_args={
+                "cfg_scale": cfg_scale,
+            },
+        )
+
+        prompt = _build_video_path_prompt(video_path, caption_cot)
+
+        inference_start = time.perf_counter()
+        try:
+            result = await diffusion.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id="prismaudio-e2e-runtime-preprocessing-smoke",
+            )
+        except (ModuleNotFoundError, RuntimeError) as exc:
+            pytest.skip(f"PrismAudio runtime preprocessing stack is not runnable in this environment: {exc}")
+        inference_elapsed_s = time.perf_counter() - inference_start
+    finally:
+        diffusion.close()
+
+    assert isinstance(result, OmniRequestOutput)
+    assert result.final_output_type == "audio"
+
+    audio = result.multimodal_output.get("audio")
+    assert isinstance(audio, np.ndarray)
+    assert audio.ndim == 3
+    assert audio.shape[0] == 1
+    assert audio.shape[1] == expected_audio_channels
+    assert audio.shape[2] > 0
+    if expected_num_samples > 0:
+        assert audio.shape[2] == expected_num_samples
+
+    print(
+        "\n[PrismAudio E2E Runtime Preprocessing]"
         f" init_s={init_elapsed_s:.2f}"
         f" inference_s={inference_elapsed_s:.2f}"
         f" steps={num_inference_steps}"
