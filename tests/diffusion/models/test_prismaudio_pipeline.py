@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -2201,6 +2202,18 @@ def test_prismaudio_pipeline_casts_official_wrapper_conditioning_to_runtime_dtyp
         "text_features": torch.bfloat16,
         "sync_features": torch.bfloat16,
     }
+
+
+def test_prismaudio_post_process_returns_numpy_audio():
+    from vllm_omni.diffusion.models.prismaudio.pipeline_prismaudio import get_prismaudio_post_process_func
+
+    post_process = get_prismaudio_post_process_func(OmniDiffusionConfig(model="prismaudio"))
+
+    audio = torch.randn(1, 2, 32, dtype=torch.bfloat16)
+    output = post_process(audio)
+
+    assert isinstance(output, np.ndarray)
+    assert output.shape == (1, 2, 32)
 
 
 def test_prismaudio_pipeline_uses_sampling_seed_for_auto_initialized_latents():

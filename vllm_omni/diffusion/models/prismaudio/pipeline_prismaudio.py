@@ -68,6 +68,20 @@ def load_prismaudio_state_dict(checkpoint_path: str | PathLike[str]) -> dict[str
     return state_dict
 
 
+def get_prismaudio_post_process_func(
+    od_config: OmniDiffusionConfig,
+):
+    def post_process_func(
+        audio: torch.Tensor,
+        output_type: str = "np",
+    ):
+        if output_type in {"latent", "pt"}:
+            return audio
+        return audio.detach().cpu().float().numpy()
+
+    return post_process_func
+
+
 def load_prismaudio_conditioning_data(conditioning_path: str | PathLike[str]) -> dict[str, Any]:
     conditioning_path = str(conditioning_path)
     path = Path(conditioning_path)
