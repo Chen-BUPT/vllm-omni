@@ -275,11 +275,19 @@ class OmniBase:
         except Exception:
             logger.exception("[%s] Finalize request handling error", self.__class__.__name__)
 
-        images = getattr(engine_outputs, "images", []) if stage_meta["final_output_type"] == "image" else []
+        effective_output_type = stage_meta["final_output_type"]
+        if (
+            stage_meta.get("stage_type") == "diffusion"
+            and isinstance(engine_outputs, OmniRequestOutput)
+            and engine_outputs.final_output_type
+        ):
+            effective_output_type = engine_outputs.final_output_type
+
+        images = getattr(engine_outputs, "images", []) if effective_output_type == "image" else []
         return OmniRequestOutput(
             request_id=req_id or "",
             stage_id=stage_id,
-            final_output_type=stage_meta["final_output_type"],
+            final_output_type=effective_output_type,
             request_output=engine_outputs,
             images=images,
             stage_durations=stage_durations,

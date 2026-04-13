@@ -69,6 +69,23 @@ def test_default_stage_config_propagates_ulysses_mode():
     assert parallel_config.ulysses_mode == "advanced_uaa"
 
 
+def test_default_stage_config_forwards_runtime_model_inputs():
+    """Ensure runtime model config and checkpoint paths reach the stage worker."""
+    model_config = {"prismaudio_model_config_path": "/tmp/prismaudio.json"}
+    model_paths = {"transformer": "/tmp/prismaudio.ckpt", "vae": "/tmp/prismaudio_vae.ckpt"}
+
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "model_config": model_config,
+            "model_paths": model_paths,
+        }
+    )[0]
+
+    engine_args = stage_cfg["engine_args"]
+    assert engine_args["model_config"] == model_config
+    assert engine_args["model_paths"] == model_paths
+
+
 def test_serve_cli_accepts_ulysses_mode():
     """Ensure diffusion serve CLI exposes ulysses_mode and wires it to parallel_config."""
     parser = FlexibleArgumentParser()

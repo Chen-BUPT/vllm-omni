@@ -12,6 +12,7 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -296,6 +297,25 @@ def _enqueue_async_diffusion_only_output(engine: FakeAsyncOmniEngine, msg: dict[
     )
 
 
+def _enqueue_async_diffusion_only_audio_output(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    request_id = msg["request_id"]
+    engine.output_q.put_nowait(
+        {
+            "type": "output",
+            "request_id": request_id,
+            "stage_id": 0,
+            "engine_outputs": OmniRequestOutput.from_diffusion(
+                request_id=request_id,
+                images=[],
+                multimodal_output={"audio": f"{request_id}-audio"},
+                final_output_type="audio",
+            ),
+            "finished": True,
+            "metrics": None,
+        }
+    )
+
+
 def _enqueue_async_llm_diffusion_outputs(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
     _enqueue_outputs(
         engine,
@@ -474,6 +494,31 @@ async def test_async_omni_diffusion_only_yields_single_image_output(monkeypatch:
     assert outputs[0].final_output_type == "image"
     assert outputs[0].images == ["req-1-image"]
     assert outputs[0].request_output.payload == "req-1-diffusion-final"
+
+
+@pytest.mark.asyncio
+async def test_async_omni_diffusion_only_audio_inherits_inner_output_type(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=DIFFUSION_ONLY_META,
+        on_add_request=_enqueue_async_diffusion_only_audio_output,
+    )
+    _patch_engine(monkeypatch, engine)
+
+    app = AsyncOmni("dummy-model")
+    try:
+        outputs = []
+        async for output in app.generate(prompt="hello", request_id="req-1"):
+            outputs.append(output)
+    finally:
+        app.shutdown()
+
+    assert len(outputs) == 1
+    assert outputs[0].stage_id == 0
+    assert outputs[0].final_output_type == "audio"
+    assert outputs[0].images == []
+    assert isinstance(outputs[0].request_output, OmniRequestOutput)
+    assert outputs[0].request_output.final_output_type == "audio"
+    assert outputs[0].request_output.multimodal_output["audio"] == "req-1-audio"
 
 
 @pytest.mark.asyncio

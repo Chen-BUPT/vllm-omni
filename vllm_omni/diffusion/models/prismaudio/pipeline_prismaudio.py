@@ -576,6 +576,29 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
                 expected_feature_dims.get(feature_name),
             )
 
+    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, torch.Tensor]]:
+        expected_feature_dims = self._get_expected_feature_dims()
+        feature_names = self._get_required_feature_names()
+        dummy_payloads: list[dict[str, torch.Tensor]] = []
+        for _ in range(num_reqs):
+            payload: dict[str, torch.Tensor] = {}
+            for feature_name in feature_names:
+                feature_width = expected_feature_dims.get(feature_name, 1)
+                # Official Prismaudio conditioners expect prompt-local
+                # features in [batch, seq_len, dim] form.
+                payload[feature_name] = torch.zeros((1, 1, int(feature_width)), dtype=torch.float32)
+            dummy_payloads.append(payload)
+        return dummy_payloads
+
+    def _is_engine_dummy_warmup_prompt(self, prompt: Any) -> bool:
+        if not isinstance(prompt, Mapping):
+            return False
+        if prompt.get("prompt") != "dummy run":
+            return False
+        additional_information = prompt.get("additional_information")
+        if additional_information not in (None, {}):
+            return False
+        return "multi_modal_data" in prompt
     def _has_required_features(self, additional_information: Mapping[str, Any]) -> bool:
         return all(
             additional_information.get(feature_name) is not None

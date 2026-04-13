@@ -34,6 +34,16 @@ Not supported yet:
 
 The upstream Prismaudio config must keep the official schema. In particular, the builder-facing `model_type` remains an upstream value such as `diffusion_cond`; it is not the same thing as the vLLM-Omni pipeline name.
 
+Use the official config from the ThinkSound / PrismAudio source tree:
+
+- `PrismAudio/configs/model_configs/prismaudio.json`
+
+Do not use a stripped-down placeholder config with only `cond_dim` and an empty
+diffusion section. The real config declares the full conditioning widths
+(`video_features=1024`, `text_features=1024`, `sync_features=768`) and the full
+diffusion model structure. The current Hugging Face repo does not ship this JSON,
+so you need to source it from the upstream repository.
+
 Minimal example:
 
 ```json
@@ -101,6 +111,13 @@ prompt = {
 
 Supported fixture formats are `.npz`, `.pt`, and `.pth`. The file must decode to
 a mapping containing at least `video_features`, `text_features`, and `sync_features`.
+
+`demo_features.npz` is not a repository fixture. It is a local, env-provided test
+artifact passed in through `PRISMAUDIO_E2E_FEATURES`. Because the repo does not
+ship that file, the exact source video depends on your local test asset. If you
+generate your own fixture, it is recommended to preserve string metadata such as
+`video_path` and `caption_cot` alongside the numeric features so the source video
+and prompt remain traceable.
 
 For follow-up runtime integration work, `vllm-omni` also accepts an optional
 `conditioning_factory` in `model_config`. This hook is intended for adapters that
@@ -209,6 +226,56 @@ This default path currently targets the official
 `data_utils.v2a_utils.feature_utils_288.FeaturesUtils` implementation. If its
 dependencies are unavailable, the pipeline surfaces an explicit feature-extractor
 dependency error rather than silently patching imports.
+
+## Video-To-Audio Example
+
+The preprocessing stack is optional, but when its dependencies are installed you
+can run Prismaudio directly from `video_path`. A minimal example looks like this:
+
+```python
+from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+omni = AsyncOmni(
+    model="/path/to/local-prismaudio-model-dir",
+    model_config={
+        "prismaudio_model_config_path": "/path/to/prismaudio.json",
+        "video_preprocessor_config": {},
+        "feature_extractor_config": {
+            "vae_config": "/path/to/stable_audio_2_0_vae.json",
+            "synchformer_ckpt": "/path/to/synchformer_state_dict.pth",
+            "need_vae_encoder": False,
+        },
+    },
+    model_paths={
+        "transformer": "/path/to/prismaudio.ckpt",
+        "vae": "/path/to/vae.ckpt",
+    },
+    dtype="bfloat16",
+    num_gpus=1,
+)
+
+prompt = {
+    "prompt": "semantic and temporal cot text",
+    "additional_information": {
+        "video_path": "/path/to/demo.mp4",
+        "caption_cot": "semantic and temporal cot text",
+    },
+}
+
+sampling = OmniDiffusionSamplingParams(
+    num_inference_steps=24,
+    extra_args={"cfg_scale": 5.0},
+)
+```
+
+There is also an env-driven smoke test for this path in
+`tests/e2e/offline_inference/test_prismaudio_model.py` under
+`test_prismaudio_real_model_with_runtime_preprocessing_e2e_smoke`.
+
+For a runnable offline entrypoint, see:
+
+- `examples/offline_inference/prismaudio/video_to_audio_example.py`
 
 The pipeline validates these tensors before model execution:
 

@@ -54,7 +54,8 @@ def test_stable_audio_model(model_name: str):
     # Extract audio from OmniRequestOutput
     assert outputs is not None
     first_output = outputs[0]
-    assert first_output.final_output_type == "image"
+    assert first_output.final_output_type == "audio"
+    assert first_output.images == []
     assert hasattr(first_output, "request_output") and first_output.request_output
 
     req_out = first_output.request_output
